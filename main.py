@@ -1,10 +1,11 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
-import numpy as np
 from sklearn.linear_model import LinearRegression
 from datetime import datetime  # Importa datetime
 import statsmodels.api as sm
+import pyodbc
 
 app = FastAPI()
 
@@ -16,6 +17,53 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],  # Permitir cualquier encabezado
 )
+server = 'agranelsv.database.windows.net'
+database = 'agraneldb'
+username = 'adminmigi'
+password = 'p@ssw0rd'
+driver = '{ODBC Driver 17 for SQL Server}'
+
+DATABASE_URL = f'DRIVER={driver};SERVER={server};DATABASE={database};UID={username};PWD={password}'
+
+
+def obtener_datos_desde_azure():
+    try:
+        # Establecer la conexión a la base de datos
+        conexion = pyodbc.connect(DATABASE_URL)
+
+        # Definir la nueva consulta SQL
+        consulta_sql = """
+        SELECT
+            V.VentaID,
+            V.FechaDeVenta,
+            P.NombreProducto,
+            DV.CantidadVendida
+        FROM
+            Ventas V
+        JOIN
+            DetallesVenta DV ON V.VentaID = DV.VentaID
+        JOIN
+            Productos P ON DV.ProductoID = P.ProductoID;
+        """
+
+        # Ejecutar la nueva consulta
+        resultados = pd.read_sql_query(consulta_sql, conexion)
+
+        return resultados.to_dict(orient='records')
+
+    except Exception as e:
+        return {"error": str(e)}
+
+    finally:
+        # Cerrar la conexión
+        if 'conexion' in locals():
+            conexion.close()
+
+
+@app.get("/obtener-datos-desde-azure/")
+async def obtener_datos_desde_azure_route():
+    return obtener_datos_desde_azure()
+
 
 # Almacenar los datos cargados en memoria
 uploaded_data = None
@@ -236,6 +284,294 @@ async def get_sales_forecast_for_next_month():
         return sales_forecast
 
     except Exception as e:
+        return {"error": str(e)}
+
+bd_data = obtener_datos_desde_azure()
+
+
+@app.get("/ventas-por-fecha/")
+async def get_ventas_por_fecha(month: int, year: int):
+    try:
+        # Crear un DataFrame desde la lista de diccionarios
+        bd_data_df = pd.DataFrame(bd_data)
+
+        # Reorganizar los datos para asegurarte de que no haya conflictos en la agrupación
+        grouped_data = bd_data_df.copy()
+
+        # Convertir 'FechaDeVenta' a tipo datetime
+        grouped_data['FechaDeVenta'] = pd.to_datetime(
+            grouped_data['FechaDeVenta'])
+
+        # Crear una nueva columna 'YearMonth'
+        grouped_data['YearMonth'] = grouped_data['FechaDeVenta'].dt.strftime(
+            '%Y-%m')
+
+        # Filtrar los datos por mes y año especificados
+        filtered_data = grouped_data[(grouped_data['FechaDeVenta'].dt.month == month) & (
+            grouped_data['FechaDeVenta'].dt.year == year)]
+
+        # Agrupar por producto
+        product_sales = filtered_data.groupby(
+            'NombreProducto')['CantidadVendida'].sum().reset_index()
+
+        # Calcular la suma de las ventas para el mes y año especificados
+        total_sales = filtered_data['CantidadVendida'].sum()
+
+        # Convertir el resultado a formato JSON
+        result = {
+            "Month": month,
+            "Year": year,
+            "TotalSales": int(total_sales),  # Convertir a int
+            # Cantidad de cada producto
+            "ProductSales": product_sales.to_dict(orient='records')
+        }
+
+        return result
+
+    except Exception as e:
+        print(f"Error en get_ventas_por_fecha: {str(e)}")
+        return {"error": str(e)}
+
+
+@app.get("/ventas-por-producto-mes/")
+async def get_ventas_por_producto_mes():
+    try:
+        # Crear un DataFrame desde la lista de diccionarios
+        bd_data_df = pd.DataFrame(bd_data)
+
+        # Reorganizar los datos para asegurarte de que no haya conflictos en la agrupación
+        grouped_data = bd_data_df.copy()
+        grouped_data['YearMonth'] = pd.to_datetime(
+            grouped_data['FechaDeVenta']).dt.strftime('%Y-%m')
+
+        # Agrupar los datos por producto y año-mes
+        product_monthly_sales = grouped_data.groupby(
+            ['NombreProducto', 'YearMonth']
+        )['CantidadVendida'].sum().reset_index()
+
+        # Convertir el resultado a formato JSON
+        product_monthly_sales_json = product_monthly_sales.to_dict(
+            orient='records')
+
+        return product_monthly_sales_json
+
+    except Exception as e:
+        print(f"Error en get_ventas_por_fecha: {str(e)}")
+        return {"error": str(e)}
+
+
+@app.get("/ventas-un-producto-mes/{nombre_producto}")
+async def get_ventas_un_producto_mes(nombre_producto: str = None):
+    try:
+        # Crear un DataFrame desde la lista de diccionarios
+        bd_data_df = pd.DataFrame(bd_data)
+
+        # Filtrar los datos solo para el producto especificado
+        product_data = bd_data_df[bd_data_df['NombreProducto']
+                                  == nombre_producto]
+
+        # Reorganizar los datos para asegurarte de que no haya conflictos en la agrupación
+        grouped_data = product_data.copy()
+        grouped_data['YearMonth'] = pd.to_datetime(
+            grouped_data['FechaDeVenta']).dt.strftime('%Y-%m')
+
+        # Agrupar los datos por producto y año-mes
+        product_monthly_sales = grouped_data.groupby(
+            ['NombreProducto', 'YearMonth']
+        )['CantidadVendida'].sum().reset_index()
+
+        # Convertir el resultado a formato JSON
+        product_monthly_sales_json = product_monthly_sales.to_dict(
+            orient='records')
+
+        return product_monthly_sales_json
+
+    except Exception as e:
+        print(f"Error en get_ventas_por_producto_mes: {str(e)}")
+        return {"error": str(e)}
+
+
+@app.get("/obtener-pronostico-producto-bd/{nombre_producto}")
+async def get_pronostico_producto_para_siguiente_mes(nombre_producto: str = None):
+    try:
+        # Obtener las ventas históricas para el producto especificado
+        historical_sales = await get_ventas_un_producto_mes(nombre_producto)
+
+        # Identificar el último mes registrado
+        last_month = max([item['YearMonth'] for item in historical_sales])
+
+        # Calcular el mes siguiente al último mes registrado (mes futuro)
+        last_month_datetime = datetime.strptime(last_month, '%Y-%m')
+        next_month = (last_month_datetime +
+                      pd.DateOffset(months=1)).strftime('%Y-%m')
+
+        # Crear un DataFrame con las ventas históricas
+        df_historical = pd.DataFrame(historical_sales)
+
+        # Filtrar las ventas históricas del producto actual
+        historical_data = df_historical['CantidadVendida']
+
+        # Convertir la serie temporal en un objeto Series de Pandas con índices de fecha
+        dates = pd.date_range(
+            start=last_month, periods=len(historical_data), freq='M')
+        sales_series = pd.Series(historical_data.values, index=dates)
+
+        # Ajustar el modelo ARIMA a los datos históricos
+        modelo = sm.tsa.ARIMA(sales_series, order=(1, 1, 1))
+        resultado = modelo.fit()
+
+        # Pronosticar las ventas para el mes futuro (1 paso)
+        pronostico_futuro = resultado.forecast(steps=1)
+
+        # Devolver el pronóstico para el producto especificado
+        sales_forecast = {
+            "NombreProducto": nombre_producto,
+            "Month": next_month,
+            "CantidadPronosticada": pronostico_futuro[0]
+        }
+
+        return sales_forecast
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/obtener-pronostico-bd/")
+async def get_pronostico_para_siguiente_mes():
+    try:
+        # Obtener las ventas históricas por producto y mes
+        historical_sales = await get_ventas_por_producto_mes()
+
+        # Identificar el último mes registrado
+        last_month = max([item['YearMonth'] for item in historical_sales])
+
+        # Calcular el mes siguiente al último mes registrado (mes futuro)
+        last_month_datetime = datetime.strptime(last_month, '%Y-%m')
+        next_month = (last_month_datetime +
+                      pd.DateOffset(months=1)).strftime('%Y-%m')
+
+        # Crear un DataFrame con las ventas históricas
+        df_historical = pd.DataFrame(historical_sales)
+
+        # Obtener la lista de todos los productos únicos
+        all_products = df_historical['NombreProducto'].unique()
+
+        # Inicializar una lista para almacenar los pronósticos de ventas futuras
+        sales_forecast = []
+
+        # Realizar pronósticos para cada producto
+        for producto in all_products:
+            # Filtrar las ventas históricas del producto actual
+            historical_data = df_historical[df_historical['NombreProducto']
+                                            == producto]['CantidadVendida']
+
+            # Convertir la serie temporal en un objeto Series de Pandas con índices de fecha
+            dates = pd.date_range(
+                start=last_month, periods=len(historical_data), freq='M')
+            sales_series = pd.Series(historical_data.values, index=dates)
+
+            # Ajustar el modelo ARIMA a los datos históricos
+            modelo = sm.tsa.ARIMA(sales_series, order=(1, 1, 1))
+            resultado = modelo.fit()
+
+            # Pronosticar las ventas para el mes futuro (1 paso)
+            pronostico_futuro = resultado.forecast(steps=1)
+
+            # Agregar el pronóstico a la lista de ventas futuras
+            sales_forecast.append({
+                "NombreProducto": producto,
+                "Month": next_month,
+                "CantidadPronosticada": pronostico_futuro[0]
+            })
+
+        return sales_forecast
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/obtener-top-pronostico-bd/")
+async def get_top_pronostico_para_siguiente_mes():
+    try:
+        # Obtener las ventas históricas por producto y mes
+        historical_sales = await get_ventas_por_producto_mes()
+
+        # Identificar el último mes registrado
+        last_month = max([item['YearMonth'] for item in historical_sales])
+
+        # Calcular el mes siguiente al último mes registrado (mes futuro)
+        last_month_datetime = datetime.strptime(last_month, '%Y-%m')
+        next_month = (last_month_datetime +
+                      pd.DateOffset(months=1)).strftime('%Y-%m')
+
+        # Crear un DataFrame con las ventas históricas
+        df_historical = pd.DataFrame(historical_sales)
+
+        # Agrupar por producto y sumar la cantidad vendida
+        resumen_demandasproductos = df_historical.groupby(
+            'NombreProducto')['CantidadVendida'].sum().reset_index()
+
+        # Encontrar los 20 productos con la mayor demanda
+        top_20_productos = resumen_demandasproductos.nlargest(
+            20, 'CantidadVendida')
+
+        # Inicializar una lista para almacenar los pronósticos de ventas futuras
+        sales_forecast = []
+
+        # Realizar pronósticos para cada producto
+        for _, producto_row in top_20_productos.iterrows():
+            producto = producto_row['NombreProducto']
+
+            # Filtrar las ventas históricas del producto actual
+            historical_data = df_historical[df_historical['NombreProducto']
+                                            == producto]['CantidadVendida']
+
+            # Convertir la serie temporal en un objeto Series de Pandas con índices de fecha
+            dates = pd.date_range(
+                start=last_month, periods=len(historical_data), freq='M')
+            sales_series = pd.Series(historical_data.values, index=dates)
+
+            # Ajustar el modelo ARIMA a los datos históricos
+            modelo = sm.tsa.ARIMA(sales_series, order=(1, 1, 1))
+            resultado = modelo.fit()
+
+            # Pronosticar las ventas para el mes futuro (1 paso)
+            pronostico_futuro = resultado.forecast(steps=1)
+
+            # Agregar el pronóstico a la lista de ventas futuras
+            sales_forecast.append({
+                "NombreProducto": producto,
+                "Month": next_month,
+                "CantidadPronosticada": pronostico_futuro[0]
+            })
+
+        return sales_forecast
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/top-productos-bd/")
+async def get_top_products_bd():
+    try:
+        # Crear un DataFrame desde la lista de diccionarios
+        bd_data_df = pd.DataFrame(bd_data)
+
+        # Agrupar por producto y sumar la cantidad vendida
+        resumen_demandasproductos = bd_data_df.groupby(
+            'NombreProducto')['CantidadVendida'].sum().reset_index()
+
+        # Encontrar los 10 productos con la mayor demanda
+        top_10_productos = resumen_demandasproductos.nlargest(
+            10, 'CantidadVendida')
+
+        # Convertir el resultado a formato JSON
+        top_10_productos_json = top_10_productos.to_dict(orient='records')
+
+        return top_10_productos_json
+
+    except Exception as e:
+        print(f"Error en get_top_products_bd: {str(e)}")
         return {"error": str(e)}
 
 if __name__ == "__main__":
